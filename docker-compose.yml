@@ -1,0 +1,144 @@
+# Общие переменные для api / worker / beat / migrate (хосты — имена сервисов Docker)
+x-app-environment: &app-environment
+  APP_NAME: ${APP_NAME:-forge-tasks}
+  APP_ENV: ${APP_ENV:-development}
+  DEBUG: ${DEBUG:-true}
+  POSTGRES_USER: ${POSTGRES_USER}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+  POSTGRES_DB: ${POSTGRES_DB}
+  POSTGRES_HOST: postgres
+  POSTGRES_PORT: 5432
+  DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+  RABBITMQ_USER: ${RABBITMQ_USER}
+  RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD}
+  RABBITMQ_HOST: rabbitmq
+  RABBITMQ_PORT: 5672
+  CELERY_BROKER_URL: amqp://${RABBITMQ_USER}:${RABBITMQ_PASSWORD}@rabbitmq:5672//
+  CELERY_RESULT_BACKEND: ${CELERY_RESULT_BACKEND:-rpc://}
+  TIMEZONE: ${TIMEZONE:-Europe/Moscow}
+
+services:
+  # База данных
+  postgres:
+    image: postgres:16-alpine
+    container_name: forge_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      - "${POSTGRES_PORT}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Брокер сообщений Celery (+ UI на порту 15672)
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: forge_rabbitmq
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD}
+    ports:
+      - "${RABBITMQ_PORT}:5672"
+      - "15672:15672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Одноразовый контейнер: alembic upgrade head
+  migrate:
+    build: .
+    container_name: forge_migrate
+    command: ["uv", "run", "alembic", "upgrade", "head"]
+    environment: *app-environment
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  # FastAPI (http://localhost:8000)
+  api:
+    build: .
+    container_name: forge_api
+    restart: unless-stopped
+    command:
+      [
+        "uv",
+        "run",
+        "uvicorn",
+        "app.main:app",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8000",
+      ]
+    ports:
+      - "8000:8000"
+    environment: *app-environment
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+
+  # Исполнитель фоновых задач
+  celery-worker:
+    build: .
+    container_name: forge_celery_worker
+    restart: unless-stopped
+    command:
+      [
+        "uv",
+        "run",
+        "celery",
+        "-A",
+        "app.celery_app",
+        "worker",
+        "--loglevel=info",
+      ]
+    environment: *app-environment
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+
+  # Планировщик периодических задач (должен быть один экземпляр)
+  celery-beat:
+    build: .
+    container_name: forge_celery_beat
+    restart: unless-stopped
+    command:
+      [
+        "uv",
+        "run",
+        "celery",
+        "-A",
+        "app.celery_app",
+        "beat",
+        "--loglevel=info",
+      ]
+    environment: *app-environment
+    volumes:
+      - celerybeat_data:/app
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
+  rabbitmq_data:
+  celerybeat_data:
